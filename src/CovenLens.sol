@@ -13,6 +13,7 @@ import {SwapMath} from "@uniswap/v4-core/src/libraries/SwapMath.sol";
 import {LiquidityMath} from "@uniswap/v4-core/src/libraries/LiquidityMath.sol";
 import {BitMath} from "@uniswap/v4-core/src/libraries/BitMath.sol";
 import {ProtocolFeeLibrary} from "@uniswap/v4-core/src/libraries/ProtocolFeeLibrary.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {ICovenRouter} from "./interfaces/ICovenRouter.sol";
 import {IUniswapV3Factory, IUniswapV3Pool} from "./interfaces/external/IUniswapV3.sol";
@@ -22,6 +23,7 @@ contract CovenLens {
     using PoolIdLibrary for PoolKey;
     using ProtocolFeeLibrary for uint24;
     using ProtocolFeeLibrary for uint16;
+    using LPFeeLibrary for uint24;
     struct Pool {
         ICovenRouter.Protocol protocol;
         address token0;
@@ -45,6 +47,7 @@ contract CovenLens {
     IPoolManager public constant POOL_MANAGER = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951);
     IV4Quoter public constant V4_QUOTER = IV4Quoter(0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94);
     uint256 public constant HOOKED_QUOTE_GAS = 2_000_000;
+    uint256 public constant MAX_SWAP_STEPS = 512;
     uint256 private constant BPS = 10_000;
     uint256 private constant Q96 = 1 << 96;
     uint256 private constant TIER_COUNT = 4;
@@ -67,8 +70,10 @@ contract CovenLens {
         if (tokenIn == tokenOut || tokenIn == address(0) || tokenOut == address(0) || amountIn == 0) {
             return (hops, 0);
         }
+        uint256[1] memory budget;
+        budget[0] = MAX_SWAP_STEPS;
         (ICovenRouter.Hop memory direct, uint256 directOut) =
-            _bestLeg(tokenIn, tokenOut, amountIn, extraPools, maxImpactBps);
+            _bestLeg(tokenIn, tokenOut, amountIn, extraPools, maxImpactBps, budget);
         if (directOut != 0) {
             hops = new ICovenRouter.Hop[](1);
             hops[0] = direct;
@@ -78,10 +83,10 @@ contract CovenLens {
             address mid = connectors[i];
             if (mid == tokenIn || mid == tokenOut || mid == address(0)) continue;
             (ICovenRouter.Hop memory first, uint256 midAmount) =
-                _bestLeg(tokenIn, mid, amountIn, extraPools, maxImpactBps);
+                _bestLeg(tokenIn, mid, amountIn, extraPools, maxImpactBps, budget);
             if (midAmount == 0) continue;
             (ICovenRouter.Hop memory second, uint256 out) =
-                _bestLeg(mid, tokenOut, midAmount, extraPools, maxImpactBps);
+                _bestLeg(mid, tokenOut, midAmount, extraPools, maxImpactBps, budget);
             if (out > amountOut) {
                 hops = new ICovenRouter.Hop[](2);
                 hops[0] = first;
@@ -146,7 +151,8 @@ contract CovenLens {
         address tokenOut,
         uint256 amountIn,
         PoolKey[] calldata extraPools,
-        uint16 maxImpactBps
+        uint16 maxImpactBps,
+        uint256[1] memory budget
     ) private returns (ICovenRouter.Hop memory best, uint256 bestOut) {
         bool zeroForOne = tokenIn < tokenOut;
         (address token0, address token1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
@@ -158,14 +164,16 @@ contract CovenLens {
                     PoolRef({isV4: false, pool: v3Pool, id: PoolId.wrap(0), tickSpacing: spacing, fee: fee}),
                     zeroForOne,
                     amountIn,
-                    maxImpactBps
+                    maxImpactBps,
+                    budget
                 );
                 if (out > bestOut) {
                     bestOut = out;
                     best = ICovenRouter.Hop(ICovenRouter.Protocol.V3, tokenOut, fee, 0, address(0));
                 }
             }
-            uint256 out4 = _simulateV4(_key(token0, token1, fee, spacing, address(0)), zeroForOne, amountIn, maxImpactBps);
+            uint256 out4 =
+                _simulateV4(_key(token0, token1, fee, spacing, address(0)), zeroForOne, amountIn, maxImpactBps, budget);
             if (out4 > bestOut) {
                 bestOut = out4;
                 best = ICovenRouter.Hop(ICovenRouter.Protocol.V4, tokenOut, fee, spacing, address(0));
@@ -175,11 +183,15 @@ contract CovenLens {
             PoolKey calldata key = extraPools[e];
             if (Currency.unwrap(key.currency0) != token0 || Currency.unwrap(key.currency1) != token1) continue;
             address hooks = address(key.hooks);
+            bool swapPermissioned = uint160(hooks) & SWAP_HOOK_FLAGS != 0;
+            bool needsAllowlist = hooks != address(0) && (swapPermissioned || key.fee.isDynamicFee());
             uint256 out;
-            if (uint160(hooks) & SWAP_HOOK_FLAGS == 0) {
-                out = _simulateV4(key, zeroForOne, amountIn, maxImpactBps);
+            if (!needsAllowlist) {
+                out = _simulateV4(key, zeroForOne, amountIn, maxImpactBps, budget);
             } else if (router.isHookAllowed(hooks)) {
-                out = _quoteHooked(key, zeroForOne, amountIn, maxImpactBps);
+                out = swapPermissioned
+                    ? _quoteHooked(key, zeroForOne, amountIn, maxImpactBps)
+                    : _simulateV4(key, zeroForOne, amountIn, maxImpactBps, budget);
             }
             if (out > bestOut) {
                 bestOut = out;
@@ -187,11 +199,13 @@ contract CovenLens {
             }
         }
     }
-    function _simulateV4(PoolKey memory key, bool zeroForOne, uint256 amountIn, uint16 maxImpactBps)
-        private
-        view
-        returns (uint256)
-    {
+    function _simulateV4(
+        PoolKey memory key,
+        bool zeroForOne,
+        uint256 amountIn,
+        uint16 maxImpactBps,
+        uint256[1] memory budget
+    ) private view returns (uint256) {
         if (key.tickSpacing < TickMath.MIN_TICK_SPACING || key.tickSpacing > TickMath.MAX_TICK_SPACING) return 0;
         PoolId id = key.toId();
         (uint160 sqrtP,, uint24 protocolFee, uint24 lpFee) = POOL_MANAGER.getSlot0(id);
@@ -203,7 +217,8 @@ contract CovenLens {
             PoolRef({isV4: true, pool: address(0), id: id, tickSpacing: key.tickSpacing, fee: swapFee}),
             zeroForOne,
             amountIn,
-            maxImpactBps
+            maxImpactBps,
+            budget
         );
     }
     function _quoteHooked(PoolKey calldata key, bool zeroForOne, uint256 amountIn, uint16 maxImpactBps)
@@ -230,11 +245,13 @@ contract CovenLens {
             : Math.mulDiv(Math.mulDiv(amountIn, Q96, sqrtP), Q96, sqrtP);
         if (amountOut < Math.mulDiv(spot, BPS - maxImpactBps, BPS)) return 0;
     }
-    function _simulate(PoolRef memory ref, bool zeroForOne, uint256 amountIn, uint16 maxImpactBps)
-        private
-        view
-        returns (uint256 amountOut)
-    {
+    function _simulate(
+        PoolRef memory ref,
+        bool zeroForOne,
+        uint256 amountIn,
+        uint16 maxImpactBps,
+        uint256[1] memory budget
+    ) private view returns (uint256 amountOut) {
         if (amountIn > uint256(type(int256).max)) return 0;
         (uint160 sqrtP, int24 tick, uint128 liquidity) = _state(ref);
         if (sqrtP == 0) return 0;
@@ -242,6 +259,8 @@ contract CovenLens {
         if (zeroForOne ? limit >= sqrtP : limit <= sqrtP) return 0;
         int256 remaining = -SafeCast.toInt256(amountIn);
         while (remaining != 0 && sqrtP != limit) {
+            if (budget[0] == 0) return 0;
+            --budget[0];
             uint160 start = sqrtP;
             (int24 next, bool initialized) = _nextTick(ref, tick, zeroForOne);
             uint160 sqrtNext = TickMath.getSqrtPriceAtTick(next);
@@ -314,8 +333,8 @@ contract CovenLens {
         }
     }
     function _priceLimit(uint160 sqrtP, bool zeroForOne, uint16 maxImpactBps) private pure returns (uint160) {
-        uint256 factor = Math.sqrt((BPS - maxImpactBps) * 1e32);
-        uint256 limit = zeroForOne ? Math.mulDiv(sqrtP, factor, 1e18) : Math.mulDiv(sqrtP, 1e18, factor);
+        uint256 factor = Math.sqrt((zeroForOne ? BPS - maxImpactBps : BPS + maxImpactBps) * 1e32);
+        uint256 limit = Math.mulDiv(sqrtP, factor, 1e18);
         if (zeroForOne) return limit <= TickMath.MIN_SQRT_PRICE ? TickMath.MIN_SQRT_PRICE + 1 : SafeCast.toUint160(limit);
         return limit >= TickMath.MAX_SQRT_PRICE ? TickMath.MAX_SQRT_PRICE - 1 : SafeCast.toUint160(limit);
     }

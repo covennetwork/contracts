@@ -4,6 +4,7 @@ pragma solidity 0.8.37;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ICovenRouter} from "../../src/interfaces/ICovenRouter.sol";
 import {CovenRouter} from "../../src/CovenRouter.sol";
 import {ICovenRouter} from "../../src/interfaces/ICovenRouter.sol";
 import {MockERC20, MockSwapRouter02, MockPoolManager, MockTokenMessenger, ReentrantToken} from "./Mocks.sol";
@@ -38,7 +39,7 @@ contract SwapAudit is Test {
         v3 = MockSwapRouter02(SWAP_ROUTER_02);
         cctp = MockTokenMessenger(TOKEN_MESSENGER);
 
-        router = new CovenRouter(owner, treasury, guardian, FEE);
+        router = new CovenRouter(owner, treasury, guardian, FEE, new address[](0), new ICovenRouter.TemplateInit[](0));
 
         tokenA = new MockERC20("A", "A");
         tokenB = new MockERC20("B", "B");

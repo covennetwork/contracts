@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.37;
 
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -68,7 +69,7 @@ contract MockSwapRouter02 is ISwapRouter02 {
 
     function exactInputSingle(ExactInputSingleParams calldata p) external payable returns (uint256 amountOut) {
         uint256 pull = consumeLess ? p.amountIn - 1 : p.amountIn;
-        MockERC20(p.tokenIn).transferFrom(msg.sender, address(this), pull);
+        require(MockERC20(p.tokenIn).transferFrom(msg.sender, address(this), pull), "tf");
         amountOut = p.amountIn * rateBps / 10_000;
         MockERC20(p.tokenOut).mint(p.recipient, amountOut);
     }
@@ -104,8 +105,8 @@ contract MockPoolManager {
         uint256 amountIn = uint256(-params.amountSpecified);
         uint256 amountOut = zeroOutput ? 0 : amountIn * rateBps / 10_000;
         uint256 reportedIn = underfillInput ? amountIn - 1 : amountIn;
-        int128 inDelta = -int128(int256(reportedIn));
-        int128 outDelta = int128(int256(amountOut));
+        int128 inDelta = -SafeCast.toInt128(SafeCast.toInt256(reportedIn));
+        int128 outDelta = SafeCast.toInt128(SafeCast.toInt256(amountOut));
         // token0 is currency0; zeroForOne => pay token0, receive token1
         if (params.zeroForOne) {
             return toBalanceDelta(inDelta, outDelta);
@@ -134,6 +135,7 @@ contract ReentrantToken is MockERC20 {
     constructor() MockERC20("Reentrant", "RE") {}
 
     function arm(address t, bytes calldata data) external {
+        require(t != address(0), "zero");
         target = t;
         reentryData = data;
         armed = true;
@@ -172,7 +174,7 @@ contract MockTokenMessenger is ITokenMessengerV2 {
         uint256,
         uint32
     ) external {
-        MockERC20(USDC).transferFrom(msg.sender, address(this), amount);
+        require(MockERC20(USDC).transferFrom(msg.sender, address(this), amount), "tf");
         lastAmount = amount;
         lastDomain = destinationDomain;
         lastRecipient = mintRecipient;
@@ -189,7 +191,7 @@ contract MockTokenMessenger is ITokenMessengerV2 {
         uint32,
         bytes calldata hookData
     ) external {
-        MockERC20(USDC).transferFrom(msg.sender, address(this), amount);
+        require(MockERC20(USDC).transferFrom(msg.sender, address(this), amount), "tf");
         lastAmount = amount;
         lastDomain = destinationDomain;
         lastRecipient = mintRecipient;

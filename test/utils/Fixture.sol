@@ -12,6 +12,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {CovenRouter} from "../../src/CovenRouter.sol";
 import {CovenLens} from "../../src/CovenLens.sol";
 import {ICovenRouter} from "../../src/interfaces/ICovenRouter.sol";
+import {Mask} from "./Mask.sol";
 import {TestToken} from "./TestToken.sol";
 import {LiquidityProvider} from "./LiquidityProvider.sol";
 import {OutputFeeHook, GreedyHook} from "./TestHooks.sol";
@@ -79,7 +80,7 @@ abstract contract Fixture is Test {
     address internal user = makeAddr("user");
     function setUp() public virtual {
         vm.createSelectFork("arc");
-        router = new CovenRouter(owner, treasury, guardian, PLATFORM_FEE_BPS);
+        router = new CovenRouter(owner, treasury, guardian, PLATFORM_FEE_BPS, new address[](0), new ICovenRouter.TemplateInit[](0));
         lens = new CovenLens(router);
         provider = new LiquidityProvider(POOL_MANAGER);
         vm.deal(address(this), 100_000_000e18);
@@ -284,7 +285,7 @@ abstract contract Fixture is Test {
             trimmed[i] = offsets[i];
         }
         vm.prank(owner);
-        id = router.addHookTemplate(referenceHook, trimmed);
+        id = router.addHookTemplate(referenceHook, Mask.windows(trimmed));
     }
     function _slice(bytes memory data, uint256 start, uint256 length) internal pure returns (bytes memory out) {
         out = new bytes(length);

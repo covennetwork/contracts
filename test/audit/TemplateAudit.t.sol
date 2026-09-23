@@ -6,6 +6,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {CovenRouter} from "../../src/CovenRouter.sol";
+import {Mask} from "../utils/Mask.sol";
 import {ICovenRouter} from "../../src/interfaces/ICovenRouter.sol";
 
 /// A hook-like contract whose two 32-byte immutables land in runtime code as PUSH32 data.
@@ -41,7 +42,7 @@ contract TemplateAudit is Test {
     address guardian = makeAddr("guardian");
 
     function setUp() public {
-        router = new CovenRouter(owner, feeRecipient, guardian, 30);
+        router = new CovenRouter(owner, feeRecipient, guardian, 30, new address[](0), new ICovenRouter.TemplateInit[](0));
     }
 
     // ---- helper: build template offsets by diffing PUSH32 immediates (safe, real-usage pattern) ----
@@ -68,6 +69,62 @@ contract TemplateAudit is Test {
         for (uint256 i; i < count; ++i) offsets[i] = tmp[i];
     }
 
+    function _hookAt(address where, uint256 f, uint256 t) internal returns (ParamHook) {
+        deployCodeTo("TemplateAudit.t.sol:ParamHook", abi.encode(f, t), where);
+        return ParamHook(where);
+    }
+
+    /// M-01 regression: identical code at an address with different permission bits is
+    /// a different hook to v4, and the template must not admit it.
+    function test_M01_templateDoesNotAdmitADifferentFlagSet() public {
+        ParamHook ref = _hookAt(0x1111111111111111111111111111111111110040, 1, 0xAAAA);
+        ParamHook sameCodeMoreFlags = _hookAt(0x22222222222222222222222222222222222200C4, 1, 0xAAAA);
+        assertEq(address(ref).code.length, address(sameCodeMoreFlags).code.length, "same code");
+
+        uint16[] memory none = new uint16[](0);
+        vm.prank(owner);
+        router.addHookTemplate(address(ref), Mask.windows(none));
+
+        assertTrue(router.isHookAllowed(address(ref)), "reference allowed");
+        assertFalse(router.isHookAllowed(address(sameCodeMoreFlags)), "escalated flag set rejected");
+    }
+
+    /// M-02 regression: a window that reaches past the end of a PUSH immediate into
+    /// executable bytes is refused at registration.
+    function test_M02_maskOverExecutableBytesIsRejected() public {
+        ParamHook ref = _hookAt(0x1111111111111111111111111111111111110040, 1, 0xAAAA);
+        uint16[] memory offs = _pushImmediateStarts(address(ref));
+        assertGt(offs.length, 0, "expected PUSH32 immediates");
+        uint16 start = offs[0];
+
+        vm.startPrank(owner);
+        // exactly the immediate: fine
+        router.addHookTemplate(address(ref), Mask.one(start, 32));
+        // one byte past it: rejected
+        vm.expectRevert(abi.encodeWithSelector(ICovenRouter.MaskCoversCode.selector, uint16(start + 1)));
+        router.addHookTemplate(address(ref), Mask.one(start + 1, 32));
+        vm.stopPrank();
+    }
+
+    function _pushImmediateStarts(address a) internal view returns (uint16[] memory out) {
+        bytes memory c = a.code;
+        uint16[] memory tmp = new uint16[](c.length);
+        uint256 count;
+        uint256 pc;
+        while (pc < c.length) {
+            uint8 op = uint8(c[pc]);
+            if (op >= 0x60 && op <= 0x7f) {
+                uint256 size = op - 0x5f;
+                if (size == 32 && pc + 1 + 32 <= c.length) tmp[count++] = SafeCast.toUint16(pc + 1);
+                pc += 1 + size;
+            } else {
+                pc += 1;
+            }
+        }
+        out = new uint16[](count);
+        for (uint256 i; i < count; ++i) out[i] = tmp[i];
+    }
+
     function _eq(bytes memory a, bytes memory b, uint256 off) internal pure returns (bool) {
         for (uint256 i; i < 32; ++i) if (a[off + i] != b[off + i]) return false;
         return true;
@@ -81,15 +138,16 @@ contract TemplateAudit is Test {
     /// NON-masked constant does NOT. This is the core soundness property AND demonstrates M1:
     /// the masked value is fully attacker-controlled (fee 1 vs fee 1e18 both admitted).
     function test_maskedConstantIsAttackerControlled_butNonMaskedMustMatch() public {
-        ParamHook ref = new ParamHook(1, 0xAAAA);        // reference: fee=1, token=0xAAAA
-        ParamHook clone = new ParamHook(1e18, 0xAAAA);   // same token, wildly different fee
-        ParamHook wrongToken = new ParamHook(1, 0xBBBB); // different NON-masked constant
+        // All three share the low 14 address bits, as a launchpad's mined clones would.
+        ParamHook ref = _hookAt(0x1111111111111111111111111111111111110040, 1, 0xAAAA);
+        ParamHook clone = _hookAt(0x2222222222222222222222222222222222220040, 1e18, 0xAAAA);
+        ParamHook wrongToken = _hookAt(0x3333333333333333333333333333333333330040, 1, 0xBBBB);
 
         uint16[] memory offsets = _diffOffsets(address(ref), address(clone)); // masks only the fee slot
         assertGt(offsets.length, 0, "expected a masked diff");
 
         vm.prank(owner);
-        router.addHookTemplate(address(ref), offsets);
+        router.addHookTemplate(address(ref), Mask.windows(offsets));
 
         assertTrue(router.isHookAllowed(address(ref)), "ref allowed");
         assertTrue(router.isHookAllowed(address(clone)), "clone with adversarial fee allowed (M1)");
@@ -106,13 +164,13 @@ contract TemplateAudit is Test {
             emit log("lengths differ - trivially rejected by codeSize check");
             uint16[] memory none = new uint16[](0);
             vm.prank(owner);
-            router.addHookTemplate(address(ref), none);
+            router.addHookTemplate(address(ref), Mask.windows(none));
             assertFalse(router.isHookAllowed(address(other)));
             return;
         }
         uint16[] memory offsets = _diffOffsets(address(ref), address(other));
         vm.prank(owner);
-        router.addHookTemplate(address(ref), offsets);
+        router.addHookTemplate(address(ref), Mask.windows(offsets));
         assertTrue(router.isHookAllowed(address(ref)));
         assertFalse(router.isHookAllowed(address(other)), "different logic must not match");
     }
@@ -164,23 +222,23 @@ contract TemplateAudit is Test {
         uint16[] memory oob = new uint16[](1);
         oob[0] = SafeCast.toUint16(size - 31);
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(address(ref), oob);
+        router.addHookTemplate(address(ref), Mask.windows(oob));
 
         // overlapping / non-ascending
         uint16[] memory overlap = new uint16[](2);
         overlap[0] = 40;
         overlap[1] = 50; // 50 < 40+32
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(address(ref), overlap);
+        router.addHookTemplate(address(ref), Mask.windows(overlap));
 
         // empty reference code
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(makeAddr("eoa"), new uint16[](0));
+        router.addHookTemplate(makeAddr("eoa"), Mask.none());
 
         // valid, then duplicate
-        router.addHookTemplate(address(ref), new uint16[](0));
+        router.addHookTemplate(address(ref), Mask.none());
         vm.expectRevert(ICovenRouter.TemplateExists.selector);
-        router.addHookTemplate(address(ref), new uint16[](0));
+        router.addHookTemplate(address(ref), Mask.none());
 
         vm.stopPrank();
     }
@@ -189,11 +247,11 @@ contract TemplateAudit is Test {
         vm.startPrank(owner);
         for (uint256 i; i < router.MAX_HOOK_TEMPLATES(); ++i) {
             ParamHook h = new ParamHook(i, 7);
-            router.addHookTemplate(address(h), new uint16[](0));
+            router.addHookTemplate(address(h), Mask.none());
         }
         ParamHook extra = new ParamHook(999, 7);
         vm.expectRevert(ICovenRouter.TooManyTemplates.selector);
-        router.addHookTemplate(address(extra), new uint16[](0));
+        router.addHookTemplate(address(extra), Mask.none());
         vm.stopPrank();
     }
 
@@ -202,9 +260,9 @@ contract TemplateAudit is Test {
         ParamHook a = new ParamHook(1, 1);
         ParamHook b = new ParamHook(2, 2);
         ParamHook c = new ParamHook(3, 3);
-        bytes32 idA = router.addHookTemplate(address(a), new uint16[](0));
-        bytes32 idB = router.addHookTemplate(address(b), new uint16[](0));
-        router.addHookTemplate(address(c), new uint16[](0));
+        bytes32 idA = router.addHookTemplate(address(a), Mask.none());
+        bytes32 idB = router.addHookTemplate(address(b), Mask.none());
+        router.addHookTemplate(address(c), Mask.none());
         assertEq(router.hookTemplateIds().length, 3);
         // remove the middle one
         router.removeHookTemplate(idB);
@@ -214,7 +272,7 @@ contract TemplateAudit is Test {
         assertTrue(router.isHookAllowed(address(c)));
         assertFalse(router.isHookAllowed(address(b)));
         // idA still resolvable
-        (uint256 sz,) = router.hookTemplate(idA);
+        (uint256 sz,,) = router.hookTemplate(idA);
         assertGt(sz, 0);
     }
 
@@ -254,7 +312,7 @@ contract TemplateAudit is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bad));
         router.setHookAllowed(bad, true);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bad));
-        router.addHookTemplate(address(router), new uint16[](0));
+        router.addHookTemplate(address(router), Mask.none());
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bad));
         router.unpause();
         vm.stopPrank();
@@ -279,14 +337,14 @@ contract TemplateAudit is Test {
 
     function test_constructorBounds() public {
         vm.expectRevert(ICovenRouter.InvalidFeeRecipient.selector);
-        new CovenRouter(owner, address(0), guardian, 30);
+        new CovenRouter(owner, address(0), guardian, 30, new address[](0), new ICovenRouter.TemplateInit[](0));
         vm.expectRevert(ICovenRouter.InvalidGuardian.selector);
-        new CovenRouter(owner, feeRecipient, address(0), 30);
+        new CovenRouter(owner, feeRecipient, address(0), 30, new address[](0), new ICovenRouter.TemplateInit[](0));
         vm.expectRevert(ICovenRouter.InvalidPlatformFee.selector);
-        new CovenRouter(owner, feeRecipient, guardian, 101);
+        new CovenRouter(owner, feeRecipient, guardian, 101, new address[](0), new ICovenRouter.TemplateInit[](0));
         // owner zero rejected by OZ Ownable
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new CovenRouter(address(0), feeRecipient, guardian, 30);
+        new CovenRouter(address(0), feeRecipient, guardian, 30, new address[](0), new ICovenRouter.TemplateInit[](0));
     }
 
     function test_pauseAuthorization() public {

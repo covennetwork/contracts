@@ -13,15 +13,18 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {ICovenRouter} from "./interfaces/ICovenRouter.sol";
 import {ISwapRouter02} from "./interfaces/external/IUniswapV3.sol";
 import {ITokenMessengerV2} from "./interfaces/external/ITokenMessengerV2.sol";
 contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
+    using LPFeeLibrary for uint24;
     struct HookTemplate {
         uint256 codeSize;
-        uint16[] maskOffsets;
+        uint16 hookFlags;
+        MaskWindow[] windows;
     }
     address public constant USDC = 0x3600000000000000000000000000000000000000;
     IPoolManager public constant POOL_MANAGER = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951);
@@ -39,14 +42,27 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
     address public feeRecipient;
     address public guardian;
     mapping(address hook => bool allowed) public hookAllowed;
+    mapping(address token => mapping(address recipient => uint256 amount)) public claimableFees;
+    mapping(address token => uint256 amount) public totalClaimableFees;
     bytes32[] private _templateIds;
     mapping(bytes32 templateId => HookTemplate template) private _templates;
-    constructor(address initialOwner, address initialFeeRecipient, address initialGuardian, uint16 initialPlatformFeeBps)
-        Ownable(initialOwner)
-    {
+    constructor(
+        address initialOwner,
+        address initialFeeRecipient,
+        address initialGuardian,
+        uint16 initialPlatformFeeBps,
+        address[] memory initialHooks,
+        TemplateInit[] memory initialTemplates
+    ) Ownable(initialOwner) {
         _setFeeRecipient(initialFeeRecipient);
         _setPlatformFee(initialPlatformFeeBps);
         _setGuardian(initialGuardian);
+        for (uint256 i; i < initialHooks.length; ++i) {
+            _setHookAllowed(initialHooks[i], true);
+        }
+        for (uint256 i; i < initialTemplates.length; ++i) {
+            _addHookTemplate(initialTemplates[i].referenceHook, initialTemplates[i].windows);
+        }
     }
     function swap(SwapParams calldata params, address recipient)
         external
@@ -127,19 +143,36 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
         if (count == 0) return false;
         bytes memory code = hook.code;
         if (code.length == 0) return false;
+        uint16 flags = SafeCast.toUint16(uint256(uint160(hook) & Hooks.ALL_HOOK_MASK));
         for (uint256 i; i < count; ++i) {
             bytes32 id = _templateIds[i];
             HookTemplate storage template = _templates[id];
-            if (template.codeSize == code.length && _maskedCodeHash(code, template.maskOffsets) == id) return true;
+            if (
+                template.codeSize == code.length && template.hookFlags == flags
+                    && _maskedCodeHash(code, template.windows) == id
+            ) return true;
         }
         return false;
     }
     function hookTemplateIds() external view returns (bytes32[] memory) {
         return _templateIds;
     }
-    function hookTemplate(bytes32 templateId) external view returns (uint256 codeSize, uint16[] memory maskOffsets) {
+    function hookTemplate(bytes32 templateId)
+        external
+        view
+        returns (uint256 codeSize, uint16 hookFlags, MaskWindow[] memory windows)
+    {
         HookTemplate storage template = _templates[templateId];
-        return (template.codeSize, template.maskOffsets);
+        return (template.codeSize, template.hookFlags, template.windows);
+    }
+    function claimFees(IERC20 token, address to) external returns (uint256 amount) {
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
+        amount = claimableFees[address(token)][msg.sender];
+        if (amount == 0) revert NothingToClaim();
+        claimableFees[address(token)][msg.sender] = 0;
+        totalClaimableFees[address(token)] -= amount;
+        token.safeTransfer(to, amount);
+        emit FeeClaimed(address(token), msg.sender, to, amount);
     }
     function pause() external {
         if (msg.sender != owner() && msg.sender != guardian) revert Unauthorized();
@@ -158,30 +191,14 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
         _setGuardian(newGuardian);
     }
     function setHookAllowed(address hook, bool allowed) external onlyOwner {
-        if (hook == address(0)) revert InvalidHook();
-        hookAllowed[hook] = allowed;
-        emit HookAllowedUpdated(hook, allowed);
+        _setHookAllowed(hook, allowed);
     }
-    function addHookTemplate(address referenceHook, uint16[] calldata maskOffsets)
+    function addHookTemplate(address referenceHook, MaskWindow[] calldata windows)
         external
         onlyOwner
         returns (bytes32 templateId)
     {
-        if (_templateIds.length >= MAX_HOOK_TEMPLATES) revert TooManyTemplates();
-        bytes memory code = referenceHook.code;
-        uint256 size = code.length;
-        if (size == 0) revert InvalidTemplate();
-        uint256 minNext;
-        for (uint256 i; i < maskOffsets.length; ++i) {
-            uint256 offset = maskOffsets[i];
-            if (offset < minNext || offset + 32 > size) revert InvalidTemplate();
-            minNext = offset + 32;
-        }
-        templateId = _maskedCodeHash(code, maskOffsets);
-        if (_templates[templateId].codeSize != 0) revert TemplateExists();
-        _templates[templateId] = HookTemplate({codeSize: size, maskOffsets: maskOffsets});
-        _templateIds.push(templateId);
-        emit HookTemplateAdded(templateId, referenceHook, size);
+        return _addHookTemplate(referenceHook, windows);
     }
     function removeHookTemplate(bytes32 templateId) external onlyOwner {
         uint256 count = _templateIds.length;
@@ -198,6 +215,10 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
     }
     function sweep(IERC20 token, address to, uint256 amount) external onlyOwner {
         if (to == address(0) || to == address(this)) revert InvalidRecipient();
+        uint256 balance = token.balanceOf(address(this));
+        uint256 reserved = totalClaimableFees[address(token)];
+        uint256 free = balance > reserved ? balance - reserved : 0;
+        if (amount > free) revert SweepExceedsFree(amount, free);
         token.safeTransfer(to, amount);
         emit Swept(address(token), to, amount);
     }
@@ -270,7 +291,7 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
                 IERC20(tokenIn).forceApprove(address(SWAP_ROUTER_02), 0);
             }
         } else {
-            if (uint160(hop.hooks) & SWAP_HOOK_FLAGS != 0 && !isHookAllowed(hop.hooks)) {
+            if (_needsAllowlist(hop.hooks, hop.fee) && !isHookAllowed(hop.hooks)) {
                 revert HookNotAllowed(hop.hooks);
             }
             bool zeroForOne = tokenIn < tokenOut;
@@ -300,8 +321,76 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
     {
         platformFee = amount * platformFeeBps / BPS;
         integratorFee = amount * integratorFeeBps / BPS;
-        if (platformFee != 0) IERC20(token).safeTransfer(feeRecipient, platformFee);
-        if (integratorFee != 0) IERC20(token).safeTransfer(integrator, integratorFee);
+        _payFee(token, feeRecipient, platformFee);
+        _payFee(token, integrator, integratorFee);
+    }
+    function _payFee(address token, address to, uint256 amount) private {
+        if (amount == 0) return;
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        if (ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))))) return;
+        claimableFees[token][to] += amount;
+        totalClaimableFees[token] += amount;
+        emit FeeAccrued(token, to, amount);
+    }
+    function _needsAllowlist(address hook, uint24 fee) private pure returns (bool) {
+        return hook != address(0) && (uint160(hook) & SWAP_HOOK_FLAGS != 0 || fee.isDynamicFee());
+    }
+    function _setHookAllowed(address hook, bool allowed) private {
+        if (hook == address(0)) revert InvalidHook();
+        hookAllowed[hook] = allowed;
+        emit HookAllowedUpdated(hook, allowed);
+    }
+    function _addHookTemplate(address referenceHook, MaskWindow[] memory windows)
+        private
+        returns (bytes32 templateId)
+    {
+        if (_templateIds.length >= MAX_HOOK_TEMPLATES) revert TooManyTemplates();
+        bytes memory code = referenceHook.code;
+        uint256 size = code.length;
+        if (size == 0) revert InvalidTemplate();
+        uint256 minNext;
+        for (uint256 i; i < windows.length; ++i) {
+            uint256 offset = windows[i].offset;
+            uint256 length = windows[i].length;
+            if (length == 0 || offset < minNext || offset + length > size) revert InvalidTemplate();
+            minNext = offset + length;
+        }
+        _assertMasksCoverConstants(code, windows);
+        templateId = _maskedCodeHash(code, windows);
+        if (_templates[templateId].codeSize != 0) revert TemplateExists();
+        uint16 flags = SafeCast.toUint16(uint256(uint160(referenceHook) & Hooks.ALL_HOOK_MASK));
+        HookTemplate storage template = _templates[templateId];
+        template.codeSize = size;
+        template.hookFlags = flags;
+        for (uint256 i; i < windows.length; ++i) {
+            template.windows.push(windows[i]);
+        }
+        _templateIds.push(templateId);
+        emit HookTemplateAdded(templateId, referenceHook, size, flags);
+    }
+    function _assertMasksCoverConstants(bytes memory code, MaskWindow[] memory windows) private pure {
+        uint256 size = code.length;
+        bytes memory isImmediate = new bytes(size);
+        uint256 pc;
+        while (pc < size) {
+            uint256 op = uint8(code[pc]);
+            if (op >= 0x60 && op <= 0x7f) {
+                uint256 n = op - 0x5f;
+                for (uint256 k = 1; k <= n && pc + k < size; ++k) {
+                    isImmediate[pc + k] = 0x01;
+                }
+                pc += 1 + n;
+            } else {
+                ++pc;
+            }
+        }
+        for (uint256 i; i < windows.length; ++i) {
+            uint256 offset = windows[i].offset;
+            uint256 length = windows[i].length;
+            for (uint256 k; k < length; ++k) {
+                if (isImmediate[offset + k] == 0) revert MaskCoversCode(windows[i].offset);
+            }
+        }
     }
     function _setPlatformFee(uint16 feeBps) private {
         if (feeBps > MAX_PLATFORM_FEE_BPS) revert InvalidPlatformFee();
@@ -318,14 +407,26 @@ contract CovenRouter is ICovenRouter, IUnlockCallback, Ownable2Step, Pausable, R
         guardian = newGuardian;
         emit GuardianUpdated(newGuardian);
     }
-    function _maskedCodeHash(bytes memory code, uint16[] memory maskOffsets) private pure returns (bytes32 hash) {
-        bytes memory masked = bytes.concat(code);
-        for (uint256 i; i < maskOffsets.length; ++i) {
-            uint256 offset = maskOffsets[i];
-            assembly ("memory-safe") {
-                mstore(add(add(masked, 0x20), offset), 0)
+    function _maskedCodeHash(bytes memory code, MaskWindow[] memory windows) private pure returns (bytes32 hash) {
+        uint256 n = windows.length;
+        bytes[] memory saved = new bytes[](n);
+        for (uint256 i; i < n; ++i) {
+            uint256 offset = windows[i].offset;
+            uint256 length = windows[i].length;
+            bytes memory keep = new bytes(length);
+            for (uint256 k; k < length; ++k) {
+                keep[k] = code[offset + k];
+                code[offset + k] = 0;
+            }
+            saved[i] = keep;
+        }
+        hash = keccak256(code);
+        for (uint256 i; i < n; ++i) {
+            uint256 offset = windows[i].offset;
+            bytes memory keep = saved[i];
+            for (uint256 k; k < keep.length; ++k) {
+                code[offset + k] = keep[k];
             }
         }
-        hash = keccak256(masked);
     }
 }

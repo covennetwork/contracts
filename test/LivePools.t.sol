@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {ICovenRouter} from "../src/interfaces/ICovenRouter.sol";
 import {CovenRouter} from "../src/CovenRouter.sol";
 import {CovenLens} from "../src/CovenLens.sol";
 import {ICovenRouter} from "../src/interfaces/ICovenRouter.sol";
@@ -22,7 +23,7 @@ contract LivePoolsTest is Test {
     function setUp() public {
         vm.createSelectFork("arc");
         address owner = makeAddr("owner");
-        router = new CovenRouter(owner, makeAddr("treasury"), owner, 0);
+        router = new CovenRouter(owner, makeAddr("treasury"), owner, 0, new address[](0), new ICovenRouter.TemplateInit[](0));
         lens = new CovenLens(router);
         vm.deal(user, 1_000e18);
         vm.prank(user);

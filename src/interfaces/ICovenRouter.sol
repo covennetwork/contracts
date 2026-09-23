@@ -29,6 +29,14 @@ interface ICovenRouter {
         uint32 minFinalityThreshold;
         bytes hookData;
     }
+    struct MaskWindow {
+        uint16 offset;
+        uint16 length;
+    }
+    struct TemplateInit {
+        address referenceHook;
+        MaskWindow[] windows;
+    }
     event Swapped(
         address indexed sender,
         address indexed tokenIn,
@@ -47,9 +55,11 @@ interface ICovenRouter {
     event FeeRecipientUpdated(address indexed feeRecipient);
     event GuardianUpdated(address indexed guardian);
     event HookAllowedUpdated(address indexed hook, bool allowed);
-    event HookTemplateAdded(bytes32 indexed templateId, address indexed referenceHook, uint256 codeSize);
+    event HookTemplateAdded(bytes32 indexed templateId, address indexed referenceHook, uint256 codeSize, uint16 hookFlags);
     event HookTemplateRemoved(bytes32 indexed templateId);
     event Swept(address indexed token, address indexed to, uint256 amount);
+    event FeeAccrued(address indexed token, address indexed recipient, uint256 amount);
+    event FeeClaimed(address indexed token, address indexed recipient, address indexed to, uint256 amount);
     error Expired();
     error InvalidPath();
     error InvalidRecipient();
@@ -60,9 +70,12 @@ interface ICovenRouter {
     error InvalidGuardian();
     error InvalidHook();
     error InvalidTemplate();
+    error MaskCoversCode(uint16 offset);
     error TemplateExists();
     error TemplateNotFound();
     error TooManyTemplates();
+    error NothingToClaim();
+    error SweepExceedsFree(uint256 requested, uint256 available);
     error ZeroAmount();
     error ZeroMinAmountOut();
     error PartialFill();

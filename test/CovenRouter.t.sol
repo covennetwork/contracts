@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Mask} from "./utils/Mask.sol";
 import {Fixture} from "./utils/Fixture.sol";
 import {ICovenRouter} from "../src/interfaces/ICovenRouter.sol";
 import {ITokenMessengerV2} from "../src/interfaces/external/ITokenMessengerV2.sol";
@@ -254,7 +255,7 @@ contract CovenRouterTest is Fixture {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         router.setHookAllowed(address(greedyHook), true);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
-        router.addHookTemplate(address(hookOne), new uint16[](0));
+        router.addHookTemplate(address(hookOne), Mask.none());
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
         router.sweep(IERC20(USDC), user, 1);
         vm.stopPrank();
@@ -291,18 +292,18 @@ contract CovenRouterTest is Fixture {
         uint16[] memory offsets = new uint16[](2);
         vm.startPrank(owner);
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(makeAddr("empty"), new uint16[](0));
+        router.addHookTemplate(makeAddr("empty"), Mask.none());
         offsets[0] = 40;
         offsets[1] = 50;
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(address(hookOne), offsets);
+        router.addHookTemplate(address(hookOne), Mask.windows(offsets));
         offsets[0] = 0;
         offsets[1] = SafeCast.toUint16(address(hookOne).code.length - 31);
         vm.expectRevert(ICovenRouter.InvalidTemplate.selector);
-        router.addHookTemplate(address(hookOne), offsets);
-        router.addHookTemplate(address(hookOne), new uint16[](0));
+        router.addHookTemplate(address(hookOne), Mask.windows(offsets));
+        router.addHookTemplate(address(hookOne), Mask.none());
         vm.expectRevert(ICovenRouter.TemplateExists.selector);
-        router.addHookTemplate(address(hookOne), new uint16[](0));
+        router.addHookTemplate(address(hookOne), Mask.none());
         vm.expectRevert(ICovenRouter.TemplateNotFound.selector);
         router.removeHookTemplate(bytes32(uint256(1)));
         vm.stopPrank();
@@ -314,10 +315,10 @@ contract CovenRouterTest is Fixture {
         for (uint256 i; i < router.MAX_HOOK_TEMPLATES(); ++i) {
             uint16[] memory offsets = new uint16[](1);
             offsets[0] = SafeCast.toUint16(i);
-            router.addHookTemplate(address(hookOne), offsets);
+            router.addHookTemplate(address(hookOne), Mask.windows(offsets));
         }
         vm.expectRevert(ICovenRouter.TooManyTemplates.selector);
-        router.addHookTemplate(address(hookTwo), new uint16[](0));
+        router.addHookTemplate(address(hookTwo), Mask.none());
         vm.stopPrank();
     }
     function test_sweepRecoversStrayTokens() public {

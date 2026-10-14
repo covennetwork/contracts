@@ -21,6 +21,7 @@ interface IV3Pool {
     function token0() external view returns (address);
     function token1() external view returns (address);
 }
+/// @notice Deprecated: superseded by CovenProbe, which @covennetwork/arb trades through from 0.5.0.
 contract CovenArb is IUnlockCallback, Ownable2Step, ReentrancyGuardTransient {
     using CurrencyLibrary for Currency;
     using TransientStateLibrary for IPoolManager;

@@ -2,22 +2,23 @@
 
 Smart contracts behind [Coven](https://coven.network), a swap platform on Arc. Coven routes trades through Uniswap v3 and v4 pools on Arc and can deliver the output as USDC on another chain through Circle's CCTP.
 
-There are five contracts.
+There are six contracts.
 
-`CovenRouter` executes swaps and holds the fee and safety settings. `CovenLens` finds and prices the best route for a trade; it stores nothing, and apps call it with `eth_call` rather than sending it transactions. `CovenSession` is a delegated-trading wallet that lets an automated agent trade an owner's balance inside caps the owner sets. `CovenSessionFactory` deploys sessions and records the ones it created. `CovenArb` is a permissionless arbitrage executor that flash-borrows from the v4 PoolManager and pays the caller any profit.
+`CovenRouter` executes swaps and holds the fee and safety settings. `CovenLens` finds and prices the best route for a trade; it stores nothing, and apps call it with `eth_call` rather than sending it transactions. `CovenSession` is a delegated-trading wallet that lets an automated agent trade an owner's balance inside caps the owner sets. `CovenSessionFactory` deploys sessions and records the ones it created. `CovenProbe` is a permissionless arbitrage contract that checks, sizes and trades routes on-chain, flash-borrowing from the v4 PoolManager and paying the caller any profit. `CovenArb` is its deprecated predecessor.
 
-The contracts were reviewed in September 2026; the report is in [audit/](audit/) and the findings it raised have been fixed. They have not had a third-party audit.
+The contracts were reviewed in September 2026; the report is in [audit/](audit/) and the findings it raised have been fixed. `CovenProbe`, written later, was not part of that review. None has had a third-party audit.
 
 ## Deployments
 
-Arc mainnet (chain ID 5042), deployed 23 September 2026.
+Arc mainnet (chain ID 5042). Deployed 23 September 2026, except `CovenProbe` (14 October 2026).
 
 | Contract | Address |
 | --- | --- |
 | CovenRouter | `0x5b86f1e5d95eFe358004B4484bF0a8C386c419a8` |
 | CovenLens | `0x098Bb65C8aBBfF80c91e2A72A4A1439D31770fed` |
 | CovenSessionFactory | `0xC7d8306A78e91d0C4fA0e5Ad6D1278A73767b057` |
-| CovenArb | `0xFFAEFEA08cD27e9f0CA6A7e7ce3047e924cb663e` |
+| CovenProbe | `0x179606809c8611BebFAC04357f0B4E0Fb8b6479E` |
+| CovenArb (deprecated) | `0xFFAEFEA08cD27e9f0CA6A7e7ce3047e924cb663e` |
 
 Sessions have no fixed address; the factory deploys one per owner with CREATE2.
 
@@ -96,6 +97,12 @@ Create sessions through `CovenSessionFactory`, which forces the canonical router
 
 ## Arbitrage
 
+`CovenProbe` takes a list of routes of up to four legs across Uniswap v4 (any hook, ERC-20 or native USDC) and v3-style pools (Uniswap v3, Synthra V3, Slipstream-style CL clones). For each route it checks the fee-adjusted prices around the cycle, sizes a two-leg trade at the price where both pools meet, runs the legs inside a v4 unlock with PoolManager flash accounting, and settles native against ERC-20 USDC where a route changes form. A route with no gap, or whose profit after the fee is below its `minProfit`, returns 0 instead of reverting, so a late send costs only the check. An optional gate (a view call with a minimum) and a first leg priced at the pool's current price let it harvest fair-launch hooks that sell their collected fees. Anyone can call it; the caller gets the profit less the fee, which accrues to the fee recipient as ERC-6909 claims. It holds no funds. The owner sets the fee, capped at 20%; each call names the highest fee it accepts.
+
+`CovenProbe.t.sol` tests it on a fork; `CovenProbeReplay.t.sol` replays real arbitrages from a case file (see its header). Both need Arc Foundry.
+
+### CovenArb (deprecated)
+
 `CovenArb` executes a plan of up to four swap legs inside a single v4 unlock, flash-borrowing whatever the first leg needs from the PoolManager. It checks that the plan ends with a positive balance in the profit token, keeps a share of that profit, and sends the rest to the caller. Anyone can call it. It holds no funds and owns no user approvals.
 
 The owner sets the fee share, capped at 20%. Each plan names the highest fee it will accept, so a fee change can't reprice a transaction that is already in flight. Fees accrue as ERC-6909 claims inside the PoolManager rather than as transfers, so a recipient that can't receive a token can't block anyone's arbitrage. Redeeming those claims means calling the PoolManager inside an unlock, so point the fee recipient at an address that can do that.
@@ -119,7 +126,8 @@ src/
   CovenLens.sol
   CovenSession.sol
   CovenSessionFactory.sol
-  CovenArb.sol
+  CovenProbe.sol         arbitrage contract
+  CovenArb.sol           deprecated arbitrage executor
   interfaces/
     ICovenRouter.sol
     external/            Uniswap v3, V4Quoter and CCTP interfaces
@@ -128,6 +136,8 @@ test/
   CovenLens.t.sol
   CovenSession.t.sol
   CovenSessionFactory.t.sol
+  CovenProbe.t.sol
+  CovenProbeReplay.t.sol replays real arbitrages (needs REPLAY_CASES)
   CovenArb.t.sol
   LivePools.t.sol        quotes and swaps against live Arc pools
   audit/                 adversarial and regression tests, runnable without an RPC

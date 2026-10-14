@@ -13,6 +13,8 @@ deny = "warnings"
 fork_retries = 10
 fork_retry_backoff = 1500
 compute_units_per_second = 60
+# CovenProbeReplay reads its cases from the arb package's research data.
+fs_permissions = [{ access = "read", path = "../arb/research/data" }]
 
 [lint]
 exclude_lints = ["block-timestamp"]

@@ -24,6 +24,7 @@ runs = 64
 
 [rpc_endpoints]
 arc = "https://rpc.mainnet.arc.io"
+robinhood = "https://rpc.mainnet.chain.robinhood.com"
 
 [dependencies]
 forge-std = "1.16.2"
